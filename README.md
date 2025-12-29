@@ -4,6 +4,8 @@ Digital Inline Holographic Reconstruction with Deep Learning
 
 ## setup.sh
 
+usage: **`source setup.sh`**
+
 Initial setup of the DIHoloReconDL Python environment.
 
 
