@@ -9,7 +9,7 @@ Initial setup of the DIHoloReconDL Python environment.
 
 ## makegds
 
-#### usage: **`./makegds.py [ -h | --help ]`**
+### usage: **`./makegds.py [ -h | --help ]`**
 
 Generates ground-truth files for hologram simulation. bsically, it takes
 files from objects_diatoms and scatters them randomly in a larger field of view.
