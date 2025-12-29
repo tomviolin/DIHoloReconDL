@@ -1,0 +1,19 @@
+{
+    "data_dir": "data/diatomsE",
+    "epochs": 100,
+    "batch_size": 16,
+    "lr": 0.1,
+    "checkpoints": "trials/trial119/chkpts",
+    "img_size": 256,
+    "in_ch": 1,
+    "out_ch": 1,
+    "workers": 7,
+    "device": "cuda",
+    "blur_gt": false,
+    "blur_holo": false,
+    "test_eval": true,
+    "load_checkpoint": "trials/trial117/chkpts/best_0100.pth",
+    "dx_um": 1.2,
+    "lambda_um": 0.65,
+    "z_mm": 0.0
+}
