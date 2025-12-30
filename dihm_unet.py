@@ -81,12 +81,15 @@ signal.signal(signal.SIGINT, signal_handler)
 
 def guicoop():
     k = cv2.waitKey(1)
-    if k != -1:
-        print(f"\x1b[1;33m[{k}]\x1b[0m", end='', flush=True)
-        if k == 27 or k == ord('q'):
-            print('Exiting...')
-            cv2.destroyAllWindows()
-            sys.exit(0)
+    if k == 27 or k == ord('q'):
+        return 1
+    else:
+        return 0
+
+def coop_exit():
+    print('Exiting...')
+    cv2.destroyAllWindows()
+    sys.exit(0)
 
 
 
@@ -478,12 +481,70 @@ class PairedHoloDataset(Dataset):
             return self.transform(torch.from_numpy(holo)), self.transform(torch.from_numpy(gt))
         return torch.from_numpy(holo), torch.from_numpy(gt)
 
+class HoloDataset(Dataset):
+    """Loads unpaired holograms. no ground-truth images.  
+    Directory structure:
+      data_dir/
+        holo/
+          sample1.png
+          sample2.png
+    """
+    def __init__(self, data_dir, split=None, transform=None, in_exts=None):
+        super().__init__()
+        self.data_dir = Path(data_dir)
+        self.holo_dir = self.data_dir / 'holo'
+        self.transform = transform
+        if in_exts is None:
+            self.exts = IMG_EXTS
+        else:
+            self.exts = in_exts
+        self.files = self._find_files()
+
+    def _find_files(self) -> List[Path]:
+        files = []
+        for p in sorted(self.holo_dir.iterdir()):
+            files.append(p.name)
+        if len(files) == 0:
+            raise RuntimeError(f'No files found in {self.holo_dir}')
+        return files
+
+    def __len__(self):
+        return len(self.files)
+
+    def _load(self, path: Path):
+        p = Path(path)
+        if p.suffix.lower() == '.npy':
+            arr = np.load(str(p))
+            if arr.ndim == 2:
+                return arr.astype(np.float32)
+            elif arr.ndim == 3:
+                # assume HWC, convert to CHW
+                return np.transpose(arr, (2,0,1)).astype(np.float32)
+            else:
+                raise RuntimeError('Unsupported .npy shape')
+        else:
+            img = Image.open(str(p)).convert('L')
+            arr = np.array(img).astype(np.float32)
+            #print(f"Loaded image {p} with shape {arr.shape} and min/max {arr.min()}/{arr.max()}")
+            return arr
+
+    def __getitem__(self, idx):
+        name = self.files[idx]
+        holo_p = self.holo_dir / name
+        holo = self._load(holo_p)
+        # ensure channel-first
+        if holo.ndim == 2:
+            holo = np.expand_dims(holo, 0)
+        if self.transform is not None:
+            return self.transform(torch.from_numpy(holo))
+        return torch.from_numpy(holo)
+
+
 # -----------------------
 # Training utilities
 # -----------------------
 
-def train_one_epoch(model, loader, optim, device, scaler=None):
-    guicoop()
+def train_one_epoch(model, loader, optim, device, scaler, epoch):
     # how to change code so there's no mixed precision for gpu
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
@@ -513,7 +574,7 @@ def train_one_epoch(model, loader, optim, device, scaler=None):
         loop_count += 1
         print(f"Train: {loop_count}/{len(loader)}", end='\r', flush=True)
         #print(f"Train one epoch: x shape = {x.shape}, y shape = {y.shape}")
-        guicoop()
+
         #print(F"x from loader shape: {x.shape}, y from loader shape: {y.shape}")
         x=fixhololevel(x)
         if args.z_mm != 0.0:
@@ -556,11 +617,12 @@ def train_one_epoch(model, loader, optim, device, scaler=None):
             loss.backward()
             optim.step()
         total_loss += float(loss.item()) * x.size(0)
-    return total_loss / len(loader.dataset)
+        if guicoop():
+            return True, total_loss / len(loader.dataset)
+    return False, total_loss / len(loader.dataset)
 
 
 def validate(model, loader, device, epoch):
-    guicoop()
     model.eval()
     #model.to(device)
     total_loss = 0.0
@@ -568,7 +630,7 @@ def validate(model, loader, device, epoch):
     with torch.no_grad():
         for x, y in loader:
             ##print(f"Validate: x shape = {x.shape}, y shape = {y.shape}")
-            guicoop()
+            if guicoop(): coop_exit()
             #print(F"x from loader shape: {x.shape}, y from loader shape: {y.shape}")
             x=fixhololevel(x)
             if args.z_mm != 0.0:
@@ -647,6 +709,43 @@ def validate(model, loader, device, epoch):
     return total_loss / len(loader.dataset)
 
 
+
+
+def evaluate(model, loader, device, epoch):
+    model.eval()
+    model.to(device)
+    datanum = 0
+    with torch.no_grad():
+        for x in loader:
+            ##print(f"Validate: x shape = {x.shape}, y shape = {y.shape}")
+            if guicoop(): coop_exit()
+            #print(F"x from loader shape: {x.shape}, y from loader shape: {y.shape}")
+            x=fixhololevel(x)
+            x = x.to(device=device, dtype=torch.float)
+            out = model(x)
+            pic_in= np.clip((x  [0,0,...].cpu().detach().numpy()*255),0,255).astype(np.uint8)
+            pic_out= np.clip((out[0,0,...].cpu().detach().numpy()*255),0,255).astype(np.uint8)
+
+            divider = np.zeros((pic_in.shape[0],10), dtype=np.uint8)
+            pic = np.hstack((pic_in,divider,pic_out)) #, divider, pic_in_prop))
+            cv2.imshow('validation', pic)
+            picdir = f'{trial_dir}/val_images'
+            nowstamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            os.makedirs(picdir, exist_ok=True)
+            datanum += 1
+            cv2.imwrite(f'{picdir}/val_{epoch:03d}_{datanum:04d}_{nowstamp}.png', pic)
+
+            #cv2.imshow('gt',  y[0,0].cpu().detach().numpy())
+            #cv2.imshow('in',  x  [0,0,...].cpu().detach().numpy())
+            #cv2.imshow('out', out[0,0,...].cpu().detach().numpy())
+            #cv2.moveWindow('gt',  0,0)
+            #cv2.moveWindow('in',  360,0)
+            #cv2.moveWindow('out', 720,0)
+            #print(f"gt range: {y.min().item():.4f} - {y.max().item():.4f}, in range: {x.min().item():.4f} - {x.max().item():.4f}, out range: {out.min().item():.4f} - {out.max().item():.4f}")
+    return
+
+
+
 def save_checkpoint(state, out_dir, name):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name)
@@ -662,8 +761,8 @@ ssim_loss = StructuralSimilarityIndexMeasure(data_range=1.0).to('cuda' if torch.
 def ssim_loss_fn (pred,target):
     return 1.0-ssim_loss(pred, target)
 
-#loss_fn = mse
-loss_fn = nn.SmoothL1Loss(beta=0.5)
+loss_fn = mse
+#loss_fn = nn.SmoothL1Loss(beta=0.5)
 
 """
 
@@ -707,6 +806,7 @@ def parse_args():
     p.add_argument('--blur_gt', action='store_true', help='if set, apply slight Gaussian blur to ground-truth images')
     p.add_argument('--blur_holo', action='store_true', help='if set, apply slight Gaussian blur to holo images')
     p.add_argument('--test_eval', action='store_true', help='if set, run evaluation only on test set (not training)')
+    p.add_argument('--eval_only', action='store_true', help='if set, this will only eval, no gts are needed')
     p.add_argument('--load_checkpoint', type=str, default='', help='if set, load from checkpoint pth file')
     p.add_argument('--dx_um', type=float, default=1.2, help='pixel size in microns')
     p.add_argument('--lambda_um', type=float, default=0.650, help='wavelength in microns')
@@ -794,7 +894,7 @@ def main():
         else:
             return '--'
 
-    choices=[ (os.path.basename(x), readme_text(x)) for x in dirlist if os.path.isdir(os.path.join(x,'gt')) ]
+    choices=[ (os.path.basename(x), readme_text(x)) for x in dirlist if os.path.isdir(os.path.join(x,'holo')) ]
     #print(choices)
     code, direct = dlg.menu(choices=choices,
                                text='Select data directory (must contain holo/ and gt/ subfolders):',
@@ -860,19 +960,25 @@ def main():
 
     # dataset
     print(f"args.img_size = {args.img_size}")
-    t = make_transforms(args.img_size)
-    ds = PairedHoloDataset(args.data_dir, transform=t)
-    # simple random split 90/10
-    n = len(ds)
-    n_test = max(1, int(0.1 * n))
-    n_val = max(1, int(0.1 * n))
-    n_train = n - n_val - n_test
-    train_ds, val_ds,test_ds = torch.utils.data.random_split(ds, [n_train, n_val, n_test])
-    if args.test_eval:
-        test_loader = DataLoader  (test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+    if not args.eval_only:
+        t = make_transforms(args.img_size)
+        ds = PairedHoloDataset(args.data_dir, transform=t)
+        # simple random split 90/10
+        n = len(ds)
+        n_test = max(1, int(0.1 * n))
+        n_val = max(1, int(0.1 * n))
+        n_train = n - n_val - n_test
+        train_ds, val_ds,test_ds = torch.utils.data.random_split(ds, [n_train, n_val, n_test])
+        if args.test_eval:
+            test_loader = DataLoader  (test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+        else:
+            train_loader = DataLoader (train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+            val_loader = DataLoader   (val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
     else:
-        train_loader = DataLoader (train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
-        val_loader = DataLoader   (val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+        t = make_transforms(args.img_size)
+        eval_ds = HoloDataset(args.data_dir, transform=None)
+        eval_loader = DataLoader  (eval_ds,  batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=True)
+
     model = UNet(in_channels=3 if args.z_mm != 0 else 1, out_channels=1).to(device)
     model.apply(init_weights_to_random)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -905,6 +1011,10 @@ def main():
     print (args.test_eval)
     print(int(args.epochs)+1)
     print ("----------------")
+    if args.eval_only:
+        evaluate(model, eval_loader, device, 0)
+        print('Evaluation complete.')
+        return  
     for epoch in range(1, int(args.epochs)+1):
         model = model.float()
         model=model.to(device)
@@ -913,20 +1023,23 @@ def main():
             test_loss = validate(model, test_loader, device, epoch)
             print(f'Test Loss: {test_loss:.6f}')
             break
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, scaler)
+        early_stop, train_loss = train_one_epoch(model, train_loader, optimizer, device, scaler,epoch)
         val_loss = validate(model, val_loader, device, epoch)
         optimizer.step()
         scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]['lr']
         is_best = val_loss < best_val
-        if is_best:
+        if is_best or early_stop:
+            name = 'best' if is_best else 'earlystop'
+            if is_best and early_stop:
+                name = 'best_earlystop'
             best_val = val_loss
             save_checkpoint({
                 'epoch': epoch,
                 'model_state': model.state_dict(),
                 'optim_state': optimizer.state_dict(),
                 'val_loss': val_loss,
-            }, args.checkpoints, name=f'epoch{epoch:03d}_best.pth')
+            }, args.checkpoints, name=f'epoch{epoch:03d}_{name}.pth')
         best_indicator = '****' if is_best else '    '
         print(f'Epoch {epoch:03d}  Train Loss: {train_loss:.6f}  Val Loss: {val_loss:.6f}  Best: {best_val:.6f}{best_indicator} LR: {current_lr:.6e}')
         if not os.path.exists(os.path.join(trial_dir, 'training_log.csv')):
