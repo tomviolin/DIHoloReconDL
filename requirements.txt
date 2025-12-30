@@ -116,7 +116,7 @@ sympy==1.14.0
 terminado==0.18.1
 tinycss2==1.4.0
 torch==2.9.1+cu126
-torchaudio==2.9.1+cu126
+torchaudio
 torchinfo==1.8.0
 torchmetrics==1.0.3
 torchvision==0.24.1+cu126

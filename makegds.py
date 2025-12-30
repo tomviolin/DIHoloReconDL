@@ -68,7 +68,7 @@ def parse_args():
 args=parse_args()
 
 srcfiles = list(glob.glob(f"{args.objects_dir}/*.png"))
-
+print (f"Found {len(srcfiles)} source files in {args.objects_dir}")
 # shuffle source files
 np.random.shuffle(srcfiles)
 # make a selection of files
