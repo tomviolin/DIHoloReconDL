@@ -19,6 +19,15 @@ Usage:
 """
 
 import os, sys, math
+from dialog import Dialog
+import locale
+locale.setlocale(locale.LC_ALL, '')
+dlg = Dialog(dialog="dialog")
+# sset up dialog to have no background
+dlg.set_background_title("DIHM UNet Trainer")
+
+
+import os, sys, math
 import argparse
 import json
 from glob import glob
@@ -40,14 +49,6 @@ trial_dir = None
 
 import datetime
 now = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-
-from dialog import Dialog
-import locale
-locale.setlocale(locale.LC_ALL, '')
-dlg = Dialog(dialog="dialog")
-# sset up dialog to have no background
-dlg.set_background_title("DIHM UNet Trainer")
-
 ## establish trial number
 trial_num = 1
 past_trials = sorted(glob(f'trials/trial*'))
@@ -886,7 +887,7 @@ def main():
 
     dirlist = sorted(glob("data/*"))
     def readme_text(d):
-        readme_file = os.path.join(d, 'README.txt')
+        readme_file = os.path.join(d, 'readme.txt')
         print(f"Looking for readme file: {readme_file}")
         if os.path.exists(readme_file):
             with open(readme_file, 'r') as f:
