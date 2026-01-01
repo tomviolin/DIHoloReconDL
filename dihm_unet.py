@@ -27,6 +27,20 @@ dlg = Dialog(dialog="dialog")
 dlg.set_background_title("DIHM UNet Trainer")
 
 
+
+# trap interrupts (Ctrl-C) to exit cleanly
+def signal_handler(sig, frame):
+    print('Exiting...')
+    cv2.destroyAllWindows()
+    sys.exit(0)
+
+import signal
+signal.signal(signal.SIGINT, signal_handler)
+
+
+
+
+
 import os, sys, math
 import argparse
 import json
@@ -44,40 +58,30 @@ from torchvision import transforms
 from torchinfo import summary
 import torch.nn.functional as F
 import torchmetrics
+device_string = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = torch.device(device_string)
+def global_exception_handler(exctype, value, tb):
+    import traceback
+    tb_lines = traceback.format_exception(exctype, value, tb)
+    tb_text = ''.join(tb_lines)
+    os.system('stty sane');
+    print("\x1b[999;1H\nA bad thing happened:\n", tb_text, flush=True, file=sys.stderr)
+    sys.exit(1)
+sys.excepthook = global_exception_handler
+
+
+def force_exit(msg):
+    os.system('stty sane');
+    print(msg, flush=True, file=sys.stderr)
+    sys.exit(1)
 
 trial_dir = None
-
+continue_training = True
+trial_num = 1
 import datetime
 now = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-## establish trial number
-trial_num = 1
-past_trials = sorted(glob(f'trials/trial*'))
-if len(past_trials) > 0:
-    last_trial = os.path.basename(past_trials[-1])
-    last_num = int(last_trial.replace('trial',''))
-    trial_num = last_num + 1
-trial_dir = f'trials/trial{trial_num:03d}'
 
-dresult = dlg.inputbox(text=f'Starting trial {trial_num:03d}. Enter description:', title='New Trial', init='')
-if dresult[0] != dlg.OK:
-    print('Exiting...')
-    sys.exit(0)
 
-trial_desc = dresult[1].strip()
-os.makedirs(trial_dir, exist_ok=True)
-with open(os.path.join(trial_dir, 'trial.json'), 'w') as f:
-    f.write(f'{{"trial_num": {trial_num}, "description": "{trial_desc}"}}\n')
-
-print(f'Starting trial {trial_num:03d}: {trial_desc}')
-
-# trap interrupts (Ctrl-C) to exit cleanly
-def signal_handler(sig, frame):
-    print('Exiting...')
-    cv2.destroyAllWindows()
-    sys.exit(0)
-
-import signal
-signal.signal(signal.SIGINT, signal_handler)
 
 
 def guicoop():
@@ -162,7 +166,7 @@ def init_weights_to_random(m):
                 m.bias.data = torch.randn(m.bias.size())
         if m.weight is not None:
             if m.weight.data is not None:
-                m.weight.data = torch.randn(m.weight.size()) * 0.01
+                m.weight.data = torch.randn(m.weight.size()) * 0.71
 
 
 class SamePaddingMaxPool2d(nn.Module):
@@ -555,17 +559,17 @@ def train_one_epoch(model, loader, optim, device, scaler, epoch):
 
     # 
     model = model.float()
-    model = model.to(device)
     model = model.train()
-    #model = model.to(device)
+    model = model.to(device)
     total_loss = 0.0
     loop_count = 0
     for x, y in loader:
         if args.blur_holo:
-            k = 5 #np.random.randint(low=0,high=5, size=1)[0]*2+1
-            sd = 1 #np.random.uniform(2,4,1)[0]
-            xx = cv2.GaussianBlur(x[0,0].cpu().detach().numpy(), (k,k),sd)
-            #xx += np.random.normal(0,0.07, xx.shape)
+            k = 7 # (5-(epoch//2 % 3)*2)    #np.random.randint(low=0,high=5, size=1)[0]*2+1
+            sd = 3#  -(epoch//2 % 4)/2 #np.random.uniform(2,4,1)[0]
+            xx = x[0,0].cpu().detach().numpy()
+            xx = cv2.GaussianBlur(xx, (k,k),sd)
+            xx *= np.random.random(size=xx.shape)*0.05+np.random.random()*0.2 + 0.75
             x[0,0,...] = torch.from_numpy(xx)
         if args.blur_gt:
             k = 5 #np.random.randint(low=0,high=3, size=1)[0]*2+1
@@ -617,6 +621,7 @@ def train_one_epoch(model, loader, optim, device, scaler, epoch):
             optim.zero_grad()
             loss.backward()
             optim.step()
+            scheduler.step()
         total_loss += float(loss.item()) * x.size(0)
         if guicoop():
             return True, total_loss / len(loader.dataset)
@@ -625,7 +630,7 @@ def train_one_epoch(model, loader, optim, device, scaler, epoch):
 
 def validate(model, loader, device, epoch):
     model.eval()
-    #model.to(device)
+    model.to(device)
     total_loss = 0.0
     datanum = 0
     with torch.no_grad():
@@ -756,13 +761,20 @@ def save_checkpoint(state, out_dir, name):
 l1 = nn.L1Loss()
 mse = nn.MSELoss()
 
-from torchmetrics.image import StructuralSimilarityIndexMeasure
-ssim_loss = StructuralSimilarityIndexMeasure(data_range=1.0).to('cuda' if torch.cuda.is_available() else 'cpu')
+def loss_fn(pred, target):
+    return l1(pred, target)*0.2 + 0.8*mse(pred, target)
 
-def ssim_loss_fn (pred,target):
-    return 1.0-ssim_loss(pred, target)
 
-loss_fn = mse
+
+
+##loss_fn = mse
+#from torchmetrics.image import StructuralSimilarityIndexMeasure
+#ssim_loss = StructuralSimilarityIndexMeasure(data_range=1.0).to('cuda' if torch.cuda.is_available() else 'cpu')
+
+#def ssim_loss_fn (pred,target):
+#    return 1.0-ssim_loss( pred, target) + l1(pred, target) + 3*mse(pred, target) 
+
+#loss_fn = ssim_loss_fn
 #loss_fn = nn.SmoothL1Loss(beta=0.5)
 
 """
@@ -793,6 +805,7 @@ def loss_fn(pred, target):
 # -----------------------
 
 def parse_args():
+    global trial_num
     p = argparse.ArgumentParser()
     p.add_argument('--data_dir', type=str, help='root data dir containing holo/ and gt/')
     p.add_argument('--epochs', type=int, default=100)
@@ -822,7 +835,7 @@ def make_transforms(img_size):
     ])
 
 def main():
-    global args, dlg, trial_dir, trial_num
+    global args, dlg, trial_dir, trial_num, device,  scheduler,checkpoint
     args = parse_args()
     argdict = vars(args)
     arglist = list(argdict)
@@ -852,6 +865,35 @@ def main():
             for k in j:
                 if k in argdict:
                     argdict[k] = j[k]
+
+
+    ## establish trial number
+    trial_num = 1
+    past_trials = sorted(glob(f'trials/trial*'))
+    if len(past_trials) > 0:
+        last_trial = os.path.basename(past_trials[-1])
+        last_num = int(last_trial.replace('trial',''))
+        trial_num = last_num + 1
+    trial_dir = f'trials/trial{trial_num:03d}'
+
+    dresult = dlg.inputbox(text=f'Starting trial {trial_num:03d}. Enter description:', title='New Trial', init=args.trial_desc if 'trial_desc' in argdict else '')
+    if dresult[0] != dlg.OK:
+        print('Exiting...')
+        sys.exit(0)
+
+    trial_desc = dresult[1].strip()
+    os.makedirs(trial_dir, exist_ok=True)
+    with open(os.path.join(trial_dir, 'trial.json'), 'w') as f:
+        f.write(f'{{"trial_num": {trial_num}, "description": "{trial_desc}"}}\n')
+    
+    # create a snapshot of this script in the trial dir
+    # so that we have a record of the code used for this trial
+    import shutil
+    shutil.copy(sys.argv[0], os.path.join(trial_dir, os.path.basename(sys.argv[0])))
+    print(f'Starting trial {trial_num:03d}: {trial_desc}')
+
+
+
     args.checkpoints = os.path.join(trial_dir, 'chkpts') 
     past_checkpoints = []
     for d in sorted(glob("trials*/trial*/*/*.pth")):
@@ -875,33 +917,51 @@ def main():
             #print(f"Found past checkpoint: {pc.split(',')[1]}  (trial desc: {desc})")
         choices = [ ( "NONE", "No Pre-training"), ] + [ (pc.split(',')[1], f"{pc.split(',')[0]}  ({os.path.dirname(os.path.dirname(pc.split(',')[1]))})") for pc in sorted(past_checkpoints)]
         #print(choices)
-        dresult = dlg.menu(choices=choices, text='Found past checkpoints. Select one to load, or NONE to start fresh.', title='Load Checkpoint', width=90, height=20)
+        dresult = dlg.menu(choices=choices, text='Found past checkpoints. Select one to load, or NONE to start fresh.', title='Load Checkpoint', width=90, height=20, default_item=args.load_checkpoint if args.load_checkpoint != '' else "NONE")
         if dresult[0] != dlg.OK:
             print('Exiting...')
             sys.exit(0)
 
-        checkpoint_to_load = dresult[1] if dresult[0] != "NONE" else ''
+        args.load_checkpoint = dresult[1] if dresult[0] != "NONE" else ''
 
     else:
-        checkpoint_to_load = ''
+        args.load_checkpoint = ''
+
+    if os.path.exists(args.load_checkpoint):
+        print(f"Loading checkpoint from: {args.load_checkpoint}")
+        # read checkpoint state if exists
+        if args.load_checkpoint:
+            checkpoint = torch.load(args.load_checkpoint, map_location=device, weights_only=False)
+            args.lr = checkpoint.get('lr', args.lr)
+            start_epoch = checkpoint.get('epoch',0)+1
+            print(f'Loaded checkpoint from {args.load_checkpoint}, resuming from epoch {start_epoch}')
+    else:
+        args.load_checkpoint = ''
 
     dirlist = sorted(glob("data/*"))
     def readme_text(d):
-        readme_file = os.path.join(d, 'readme.txt')
-        print(f"Looking for readme file: {readme_file}")
-        if os.path.exists(readme_file):
-            with open(readme_file, 'r') as f:
-                return f.read()
+        readme_p = os.path.join(d, 'readme.txt')
+        if os.path.exists(readme_p):
+            with open(readme_p, 'r') as f:
+                desc = f.read()
+            return desc
         else:
-            return '--'
-
-    choices=[ (os.path.basename(x), readme_text(x)) for x in dirlist if os.path.isdir(os.path.join(x,'holo')) ]
-    #print(choices)
+            return ''
+    choices=[]
+    for dr in dirlist:
+        holos = glob(os.path.join(dr, 'holo/*'))
+        gts = glob(os.path.join(dr, 'gt/*'))
+        if len(holos) == 0 :
+            continue
+        desc = f"[{len(holos)}] "+readme_text(dr)
+        dtag = dr.split('/')[-1]
+        choices.append( (dtag, desc) )
     code, direct = dlg.menu(choices=choices,
                                text='Select data directory (must contain holo/ and gt/ subfolders):',
                                title='Select Data Directory',
                                width=90,
-                               height=20)
+                               height=20,
+                               default_item=args.data_dir.split('/')[-1] if args.data_dir is not None else None)
     if code != dlg.OK:
         print('Exiting...')
         sys.exit(0)
@@ -909,9 +969,9 @@ def main():
     data_dir = os.path.join('data',direct)
     argdict['data_dir'] = data_dir
 
-    if checkpoint_to_load != '':
-        argdict['load_checkpoint'] = checkpoint_to_load
-
+    if args.load_checkpoint:
+        checkpoint = torch.load(args.load_checkpoint, map_location=device, weights_only=False)
+        args.lr = checkpoint.get('lr', args.lr)
     #input()
     # label, yl, xl, item, yi, xi, field_length, input_length
     dialog_elements = [ (arglist[i], i+1,1, str(argdict[arglist[i]]), i+1,25,50,50) for i in range(len(arglist)) ]
@@ -982,14 +1042,27 @@ def main():
 
     model = UNet(in_channels=3 if args.z_mm != 0 else 1, out_channels=1).to(device)
     model.apply(init_weights_to_random)
+    model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # Source - https://stackoverflow.com/a
+    # Posted by patapouf_ai, modified by community. See post 'Timeline' for change history
+    # Retrieved 2025-12-31, License - CC BY-SA 4.0
+    for g in optimizer.param_groups:
+        g['lr'] = args.lr
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.9)
 
-    #scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
-    scaler = None
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+    #scaler = None
     print('Model summary:')
     print(f'input_size: (1, {args.in_ch}, {args.img_size}, {args.img_size})')
     print(f"model device = {next(model.parameters()).device}")
+    if args.load_checkpoint:
+        checkpoint_path = args.load_checkpoint
+        #checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state'])
+        optimizer.load_state_dict(checkpoint['optim_state'])
+        best_val = checkpoint.get('best_val', float('inf'))
+
     model.to(device)
 
     print(f"MOD PARM: {next(model.parameters()).device}") # Check model device
@@ -998,16 +1071,6 @@ def main():
     best_val = float('inf')
     # model gradient reset
     model.zero_grad()
-    # read checkpoint state if exists
-    if args.load_checkpoint:
-        checkpoint_path = args.load_checkpoint
-        if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state'])
-            optimizer.load_state_dict(checkpoint['optim_state'])
-            start_epoch = checkpoint['epoch'] + 1
-            best_val = checkpoint.get('best_val', float('inf'))
-            print(f'Loaded checkpoint from {checkpoint_path}, resuming from epoch {start_epoch}')
     print('Starting training...')
     print (args.test_eval)
     print(int(args.epochs)+1)
@@ -1016,18 +1079,24 @@ def main():
         evaluate(model, eval_loader, device, 0)
         print('Evaluation complete.')
         return  
+    model = model.float()
+    model=model.to(device)
     for epoch in range(1, int(args.epochs)+1):
-        model = model.float()
-        model=model.to(device)
         model.zero_grad()
+        for g in optimizer.param_groups:
+            g['lr'] = args.lr
+            args.lr = args.lr * 0.95
+            if args.lr < 0.01*np.exp(-epoch/70):
+                args.lr = 0.05*np.exp(-epoch/70)
         if args.test_eval:
             test_loss = validate(model, test_loader, device, epoch)
             print(f'Test Loss: {test_loss:.6f}')
             break
+        model.to(device)
         early_stop, train_loss = train_one_epoch(model, train_loader, optimizer, device, scaler,epoch)
         val_loss = validate(model, val_loader, device, epoch)
-        optimizer.step()
-        scheduler.step(val_loss)
+        #optimizer.step()
+        #scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]['lr']
         is_best = val_loss < best_val
         if is_best or early_stop:
@@ -1040,20 +1109,28 @@ def main():
                 'model_state': model.state_dict(),
                 'optim_state': optimizer.state_dict(),
                 'val_loss': val_loss,
+                'lr': current_lr,
+                'best_val': best_val,
             }, args.checkpoints, name=f'epoch{epoch:03d}_{name}.pth')
         best_indicator = '****' if is_best else '    '
+        if early_stop:
+            best_indicator = 'STOP'
         print(f'Epoch {epoch:03d}  Train Loss: {train_loss:.6f}  Val Loss: {val_loss:.6f}  Best: {best_val:.6f}{best_indicator} LR: {current_lr:.6e}')
         if not os.path.exists(os.path.join(trial_dir, 'training_log.csv')):
             print('epoch,timestamp,train_loss,val_loss,best_val,learning_rate,is_best', file=open(os.path.join(trial_dir, 'training_log.csv'), 'w'))
         nowstamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"{epoch},{nowstamp},{train_loss:.6f},{val_loss:.6f},{best_val:.6f},{current_lr:.6e},{'1' if is_best else '0'}",
               file=open(os.path.join(trial_dir, 'training_log.csv'), 'a'))
-
+        if early_stop:
+            print('Early stopping triggered. Ending training.')
+            break
     if not args.test_eval:
         save_checkpoint({
             'epoch': epoch,
             'model_state': model.state_dict(),
             'optim_state': optimizer.state_dict(),
+            'lr': current_lr,
+            'best_val': best_val,
             'val_loss': val_loss,
         }, args.checkpoints, name=f'epoch{epoch:03d}_final.pth')
     print('Training complete. Best val loss:', best_val)

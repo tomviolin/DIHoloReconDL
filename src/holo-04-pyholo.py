@@ -39,13 +39,10 @@ def global_exception_handler(exctype, value, tb):
     os.system('stty sane');
     print("\x1b[999;1H\nA bad thing happened:\n", tb_text, flush=True, file=sys.stderr)
     sys.exit(1)
-
-
 sys.excepthook = global_exception_handler
 
 
 def force_exit(msg):
-    os.system('reset')
     os.system('stty sane');
     print(msg, flush=True, file=sys.stderr)
     sys.exit(1)
