@@ -25,5 +25,5 @@ README*~
 !make_holograms_enhanced.py
 !objects_diatoms
 !objects_diatoms/*
-
+!teststream.py
 
