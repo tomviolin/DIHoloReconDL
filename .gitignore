@@ -26,4 +26,5 @@ README*~
 !objects_diatoms
 !objects_diatoms/*
 !teststream.py
-
+!subavg.py
+!graphtrials.ipynb

@@ -19,6 +19,29 @@ Usage:
 """
 
 import os, sys, math
+from dialog import Dialog
+import locale
+locale.setlocale(locale.LC_ALL, '')
+dlg = Dialog(dialog="dialog")
+# sset up dialog to have no background
+dlg.set_background_title("DIHM UNet Trainer")
+
+
+
+# trap interrupts (Ctrl-C) to exit cleanly
+def signal_handler(sig, frame):
+    print('Exiting...')
+    cv2.destroyAllWindows()
+    sys.exit(0)
+
+import signal
+signal.signal(signal.SIGINT, signal_handler)
+
+
+
+
+
+import os, sys, math
 import argparse
 import json
 from glob import glob
@@ -35,58 +58,43 @@ from torchvision import transforms
 from torchinfo import summary
 import torch.nn.functional as F
 import torchmetrics
+device_string = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = torch.device(device_string)
+def global_exception_handler(exctype, value, tb):
+    import traceback
+    tb_lines = traceback.format_exception(exctype, value, tb)
+    tb_text = ''.join(tb_lines)
+    os.system('stty sane');
+    print("\x1b[999;1H\nA bad thing happened:\n", tb_text, flush=True, file=sys.stderr)
+    sys.exit(1)
+sys.excepthook = global_exception_handler
+
+
+def force_exit(msg):
+    os.system('stty sane');
+    print(msg, flush=True, file=sys.stderr)
+    sys.exit(1)
 
 trial_dir = None
-
+continue_training = True
+trial_num = 1
 import datetime
 now = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
 
-from dialog import Dialog
-import locale
-locale.setlocale(locale.LC_ALL, '')
-dlg = Dialog(dialog="dialog")
-# sset up dialog to have no background
-dlg.set_background_title("DIHM UNet Trainer")
 
-## establish trial number
-trial_num = 1
-past_trials = sorted(glob(f'trials/trial*'))
-if len(past_trials) > 0:
-    last_trial = os.path.basename(past_trials[-1])
-    last_num = int(last_trial.replace('trial',''))
-    trial_num = last_num + 1
-trial_dir = f'trials/trial{trial_num:03d}'
-
-dresult = dlg.inputbox(text=f'Starting trial {trial_num:03d}. Enter description:', title='New Trial', init='')
-if dresult[0] != dlg.OK:
-    print('Exiting...')
-    sys.exit(0)
-
-trial_desc = dresult[1].strip()
-os.makedirs(trial_dir, exist_ok=True)
-with open(os.path.join(trial_dir, 'trial.json'), 'w') as f:
-    f.write(f'{{"trial_num": {trial_num}, "description": "{trial_desc}"}}\n')
-
-print(f'Starting trial {trial_num:03d}: {trial_desc}')
-
-# trap interrupts (Ctrl-C) to exit cleanly
-def signal_handler(sig, frame):
-    print('Exiting...')
-    cv2.destroyAllWindows()
-    sys.exit(0)
-
-import signal
-signal.signal(signal.SIGINT, signal_handler)
 
 
 def guicoop():
     k = cv2.waitKey(1)
-    if k != -1:
-        print(f"\x1b[1;33m[{k}]\x1b[0m", end='', flush=True)
-        if k == 27 or k == ord('q'):
-            print('Exiting...')
-            cv2.destroyAllWindows()
-            sys.exit(0)
+    if k == 27 or k == ord('q'):
+        return 1
+    else:
+        return 0
+
+def coop_exit():
+    print('Exiting...')
+    cv2.destroyAllWindows()
+    sys.exit(0)
 
 
 
@@ -158,7 +166,7 @@ def init_weights_to_random(m):
                 m.bias.data = torch.randn(m.bias.size())
         if m.weight is not None:
             if m.weight.data is not None:
-                m.weight.data = torch.randn(m.weight.size()) * 0.01
+                m.weight.data = torch.randn(m.weight.size()) * 0.71
 
 
 class SamePaddingMaxPool2d(nn.Module):
@@ -478,12 +486,70 @@ class PairedHoloDataset(Dataset):
             return self.transform(torch.from_numpy(holo)), self.transform(torch.from_numpy(gt))
         return torch.from_numpy(holo), torch.from_numpy(gt)
 
+class HoloDataset(Dataset):
+    """Loads unpaired holograms. no ground-truth images.  
+    Directory structure:
+      data_dir/
+        holo/
+          sample1.png
+          sample2.png
+    """
+    def __init__(self, data_dir, split=None, transform=None, in_exts=None):
+        super().__init__()
+        self.data_dir = Path(data_dir)
+        self.holo_dir = self.data_dir / 'holo'
+        self.transform = transform
+        if in_exts is None:
+            self.exts = IMG_EXTS
+        else:
+            self.exts = in_exts
+        self.files = self._find_files()
+
+    def _find_files(self) -> List[Path]:
+        files = []
+        for p in sorted(self.holo_dir.iterdir()):
+            files.append(p.name)
+        if len(files) == 0:
+            raise RuntimeError(f'No files found in {self.holo_dir}')
+        return files
+
+    def __len__(self):
+        return len(self.files)
+
+    def _load(self, path: Path):
+        p = Path(path)
+        if p.suffix.lower() == '.npy':
+            arr = np.load(str(p))
+            if arr.ndim == 2:
+                return arr.astype(np.float32)
+            elif arr.ndim == 3:
+                # assume HWC, convert to CHW
+                return np.transpose(arr, (2,0,1)).astype(np.float32)
+            else:
+                raise RuntimeError('Unsupported .npy shape')
+        else:
+            img = Image.open(str(p)).convert('L')
+            arr = np.array(img).astype(np.float32)
+            #print(f"Loaded image {p} with shape {arr.shape} and min/max {arr.min()}/{arr.max()}")
+            return arr
+
+    def __getitem__(self, idx):
+        name = self.files[idx]
+        holo_p = self.holo_dir / name
+        holo = self._load(holo_p)
+        # ensure channel-first
+        if holo.ndim == 2:
+            holo = np.expand_dims(holo, 0)
+        if self.transform is not None:
+            return self.transform(torch.from_numpy(holo))
+        return torch.from_numpy(holo)
+
+
 # -----------------------
 # Training utilities
 # -----------------------
 
-def train_one_epoch(model, loader, optim, device, scaler=None):
-    guicoop()
+def train_one_epoch(model, loader, optim, device, scaler, epoch):
     # how to change code so there's no mixed precision for gpu
     if device.type == 'cuda':
         torch.backends.cudnn.benchmark = True
@@ -493,17 +559,17 @@ def train_one_epoch(model, loader, optim, device, scaler=None):
 
     # 
     model = model.float()
-    model = model.to(device)
     model = model.train()
-    #model = model.to(device)
+    model = model.to(device)
     total_loss = 0.0
     loop_count = 0
     for x, y in loader:
         if args.blur_holo:
-            k = 5 #np.random.randint(low=0,high=5, size=1)[0]*2+1
-            sd = 1 #np.random.uniform(2,4,1)[0]
-            xx = cv2.GaussianBlur(x[0,0].cpu().detach().numpy(), (k,k),sd)
-            #xx += np.random.normal(0,0.07, xx.shape)
+            k = 7 # (5-(epoch//2 % 3)*2)    #np.random.randint(low=0,high=5, size=1)[0]*2+1
+            sd = 3#  -(epoch//2 % 4)/2 #np.random.uniform(2,4,1)[0]
+            xx = x[0,0].cpu().detach().numpy()
+            xx = cv2.GaussianBlur(xx, (k,k),sd)
+            xx *= np.random.random(size=xx.shape)*0.05+np.random.random()*0.2 + 0.75
             x[0,0,...] = torch.from_numpy(xx)
         if args.blur_gt:
             k = 5 #np.random.randint(low=0,high=3, size=1)[0]*2+1
@@ -513,7 +579,7 @@ def train_one_epoch(model, loader, optim, device, scaler=None):
         loop_count += 1
         print(f"Train: {loop_count}/{len(loader)}", end='\r', flush=True)
         #print(f"Train one epoch: x shape = {x.shape}, y shape = {y.shape}")
-        guicoop()
+
         #print(F"x from loader shape: {x.shape}, y from loader shape: {y.shape}")
         x=fixhololevel(x)
         if args.z_mm != 0.0:
@@ -555,20 +621,22 @@ def train_one_epoch(model, loader, optim, device, scaler=None):
             optim.zero_grad()
             loss.backward()
             optim.step()
+            scheduler.step()
         total_loss += float(loss.item()) * x.size(0)
-    return total_loss / len(loader.dataset)
+        if guicoop():
+            return True, total_loss / len(loader.dataset)
+    return False, total_loss / len(loader.dataset)
 
 
 def validate(model, loader, device, epoch):
-    guicoop()
     model.eval()
-    #model.to(device)
+    model.to(device)
     total_loss = 0.0
     datanum = 0
     with torch.no_grad():
         for x, y in loader:
             ##print(f"Validate: x shape = {x.shape}, y shape = {y.shape}")
-            guicoop()
+            if guicoop(): coop_exit()
             #print(F"x from loader shape: {x.shape}, y from loader shape: {y.shape}")
             x=fixhololevel(x)
             if args.z_mm != 0.0:
@@ -647,6 +715,43 @@ def validate(model, loader, device, epoch):
     return total_loss / len(loader.dataset)
 
 
+
+
+def evaluate(model, loader, device, epoch):
+    model.eval()
+    model.to(device)
+    datanum = 0
+    with torch.no_grad():
+        for x in loader:
+            ##print(f"Validate: x shape = {x.shape}, y shape = {y.shape}")
+            if guicoop(): coop_exit()
+            #print(F"x from loader shape: {x.shape}, y from loader shape: {y.shape}")
+            x=fixhololevel(x)
+            x = x.to(device=device, dtype=torch.float)
+            out = model(x)
+            pic_in= np.clip((x  [0,0,...].cpu().detach().numpy()*255),0,255).astype(np.uint8)
+            pic_out= np.clip((out[0,0,...].cpu().detach().numpy()*255),0,255).astype(np.uint8)
+
+            divider = np.zeros((pic_in.shape[0],10), dtype=np.uint8)
+            pic = np.hstack((pic_in,divider,pic_out)) #, divider, pic_in_prop))
+            cv2.imshow('validation', pic)
+            picdir = f'{trial_dir}/val_images'
+            nowstamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            os.makedirs(picdir, exist_ok=True)
+            datanum += 1
+            cv2.imwrite(f'{picdir}/val_{epoch:03d}_{datanum:04d}_{nowstamp}.png', pic)
+
+            #cv2.imshow('gt',  y[0,0].cpu().detach().numpy())
+            #cv2.imshow('in',  x  [0,0,...].cpu().detach().numpy())
+            #cv2.imshow('out', out[0,0,...].cpu().detach().numpy())
+            #cv2.moveWindow('gt',  0,0)
+            #cv2.moveWindow('in',  360,0)
+            #cv2.moveWindow('out', 720,0)
+            #print(f"gt range: {y.min().item():.4f} - {y.max().item():.4f}, in range: {x.min().item():.4f} - {x.max().item():.4f}, out range: {out.min().item():.4f} - {out.max().item():.4f}")
+    return
+
+
+
 def save_checkpoint(state, out_dir, name):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, name)
@@ -656,14 +761,21 @@ def save_checkpoint(state, out_dir, name):
 l1 = nn.L1Loss()
 mse = nn.MSELoss()
 
-from torchmetrics.image import StructuralSimilarityIndexMeasure
-ssim_loss = StructuralSimilarityIndexMeasure(data_range=1.0).to('cuda' if torch.cuda.is_available() else 'cpu')
+def loss_fn(pred, target):
+    return l1(pred, target)*0.2 + 0.8*mse(pred, target)
 
-def ssim_loss_fn (pred,target):
-    return 1.0-ssim_loss(pred, target)
 
-#loss_fn = mse
-loss_fn = nn.SmoothL1Loss(beta=0.5)
+
+
+##loss_fn = mse
+#from torchmetrics.image import StructuralSimilarityIndexMeasure
+#ssim_loss = StructuralSimilarityIndexMeasure(data_range=1.0).to('cuda' if torch.cuda.is_available() else 'cpu')
+
+#def ssim_loss_fn (pred,target):
+#    return 1.0-ssim_loss( pred, target) + l1(pred, target) + 3*mse(pred, target) 
+
+#loss_fn = ssim_loss_fn
+#loss_fn = nn.SmoothL1Loss(beta=0.5)
 
 """
 
@@ -693,6 +805,7 @@ def loss_fn(pred, target):
 # -----------------------
 
 def parse_args():
+    global trial_num
     p = argparse.ArgumentParser()
     p.add_argument('--data_dir', type=str, help='root data dir containing holo/ and gt/')
     p.add_argument('--epochs', type=int, default=100)
@@ -707,6 +820,7 @@ def parse_args():
     p.add_argument('--blur_gt', action='store_true', help='if set, apply slight Gaussian blur to ground-truth images')
     p.add_argument('--blur_holo', action='store_true', help='if set, apply slight Gaussian blur to holo images')
     p.add_argument('--test_eval', action='store_true', help='if set, run evaluation only on test set (not training)')
+    p.add_argument('--eval_only', action='store_true', help='if set, this will only eval, no gts are needed')
     p.add_argument('--load_checkpoint', type=str, default='', help='if set, load from checkpoint pth file')
     p.add_argument('--dx_um', type=float, default=1.2, help='pixel size in microns')
     p.add_argument('--lambda_um', type=float, default=0.650, help='wavelength in microns')
@@ -721,7 +835,7 @@ def make_transforms(img_size):
     ])
 
 def main():
-    global args, dlg, trial_dir, trial_num
+    global args, dlg, trial_dir, trial_num, device,  scheduler,checkpoint
     args = parse_args()
     argdict = vars(args)
     arglist = list(argdict)
@@ -751,6 +865,35 @@ def main():
             for k in j:
                 if k in argdict:
                     argdict[k] = j[k]
+
+
+    ## establish trial number
+    trial_num = 1
+    past_trials = sorted(glob(f'trials/trial*'))
+    if len(past_trials) > 0:
+        last_trial = os.path.basename(past_trials[-1])
+        last_num = int(last_trial.replace('trial',''))
+        trial_num = last_num + 1
+    trial_dir = f'trials/trial{trial_num:03d}'
+
+    dresult = dlg.inputbox(text=f'Starting trial {trial_num:03d}. Enter description:', title='New Trial', init=args.trial_desc if 'trial_desc' in argdict else '')
+    if dresult[0] != dlg.OK:
+        print('Exiting...')
+        sys.exit(0)
+
+    trial_desc = dresult[1].strip()
+    os.makedirs(trial_dir, exist_ok=True)
+    with open(os.path.join(trial_dir, 'trial.json'), 'w') as f:
+        f.write(f'{{"trial_num": {trial_num}, "description": "{trial_desc}"}}\n')
+    
+    # create a snapshot of this script in the trial dir
+    # so that we have a record of the code used for this trial
+    import shutil
+    shutil.copy(sys.argv[0], os.path.join(trial_dir, os.path.basename(sys.argv[0])))
+    print(f'Starting trial {trial_num:03d}: {trial_desc}')
+
+
+
     args.checkpoints = os.path.join(trial_dir, 'chkpts') 
     past_checkpoints = []
     for d in sorted(glob("trials*/trial*/*/*.pth")):
@@ -774,33 +917,51 @@ def main():
             #print(f"Found past checkpoint: {pc.split(',')[1]}  (trial desc: {desc})")
         choices = [ ( "NONE", "No Pre-training"), ] + [ (pc.split(',')[1], f"{pc.split(',')[0]}  ({os.path.dirname(os.path.dirname(pc.split(',')[1]))})") for pc in sorted(past_checkpoints)]
         #print(choices)
-        dresult = dlg.menu(choices=choices, text='Found past checkpoints. Select one to load, or NONE to start fresh.', title='Load Checkpoint', width=90, height=20)
+        dresult = dlg.menu(choices=choices, text='Found past checkpoints. Select one to load, or NONE to start fresh.', title='Load Checkpoint', width=90, height=20, default_item=args.load_checkpoint if args.load_checkpoint != '' else "NONE")
         if dresult[0] != dlg.OK:
             print('Exiting...')
             sys.exit(0)
 
-        checkpoint_to_load = dresult[1] if dresult[0] != "NONE" else ''
+        args.load_checkpoint = dresult[1] if dresult[0] != "NONE" else ''
 
     else:
-        checkpoint_to_load = ''
+        args.load_checkpoint = ''
+
+    if os.path.exists(args.load_checkpoint):
+        print(f"Loading checkpoint from: {args.load_checkpoint}")
+        # read checkpoint state if exists
+        if args.load_checkpoint:
+            checkpoint = torch.load(args.load_checkpoint, map_location=device, weights_only=False)
+            args.lr = checkpoint.get('lr', args.lr)
+            start_epoch = checkpoint.get('epoch',0)+1
+            print(f'Loaded checkpoint from {args.load_checkpoint}, resuming from epoch {start_epoch}')
+    else:
+        args.load_checkpoint = ''
 
     dirlist = sorted(glob("data/*"))
     def readme_text(d):
-        readme_file = os.path.join(d, 'README.txt')
-        print(f"Looking for readme file: {readme_file}")
-        if os.path.exists(readme_file):
-            with open(readme_file, 'r') as f:
-                return f.read()
+        readme_p = os.path.join(d, 'readme.txt')
+        if os.path.exists(readme_p):
+            with open(readme_p, 'r') as f:
+                desc = f.read()
+            return desc
         else:
-            return '--'
-
-    choices=[ (os.path.basename(x), readme_text(x)) for x in dirlist if os.path.isdir(os.path.join(x,'gt')) ]
-    #print(choices)
+            return ''
+    choices=[]
+    for dr in dirlist:
+        holos = glob(os.path.join(dr, 'holo/*'))
+        gts = glob(os.path.join(dr, 'gt/*'))
+        if len(holos) == 0 :
+            continue
+        desc = f"[{len(holos)}] "+readme_text(dr)
+        dtag = dr.split('/')[-1]
+        choices.append( (dtag, desc) )
     code, direct = dlg.menu(choices=choices,
                                text='Select data directory (must contain holo/ and gt/ subfolders):',
                                title='Select Data Directory',
                                width=90,
-                               height=20)
+                               height=20,
+                               default_item=args.data_dir.split('/')[-1] if args.data_dir is not None else None)
     if code != dlg.OK:
         print('Exiting...')
         sys.exit(0)
@@ -808,9 +969,9 @@ def main():
     data_dir = os.path.join('data',direct)
     argdict['data_dir'] = data_dir
 
-    if checkpoint_to_load != '':
-        argdict['load_checkpoint'] = checkpoint_to_load
-
+    if args.load_checkpoint:
+        checkpoint = torch.load(args.load_checkpoint, map_location=device, weights_only=False)
+        args.lr = checkpoint.get('lr', args.lr)
     #input()
     # label, yl, xl, item, yi, xi, field_length, input_length
     dialog_elements = [ (arglist[i], i+1,1, str(argdict[arglist[i]]), i+1,25,50,50) for i in range(len(arglist)) ]
@@ -860,29 +1021,48 @@ def main():
 
     # dataset
     print(f"args.img_size = {args.img_size}")
-    t = make_transforms(args.img_size)
-    ds = PairedHoloDataset(args.data_dir, transform=t)
-    # simple random split 90/10
-    n = len(ds)
-    n_test = max(1, int(0.1 * n))
-    n_val = max(1, int(0.1 * n))
-    n_train = n - n_val - n_test
-    train_ds, val_ds,test_ds = torch.utils.data.random_split(ds, [n_train, n_val, n_test])
-    if args.test_eval:
-        test_loader = DataLoader  (test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+    if not args.eval_only:
+        t = make_transforms(args.img_size)
+        ds = PairedHoloDataset(args.data_dir, transform=t)
+        # simple random split 90/10
+        n = len(ds)
+        n_test = max(1, int(0.1 * n))
+        n_val = max(1, int(0.1 * n))
+        n_train = n - n_val - n_test
+        train_ds, val_ds,test_ds = torch.utils.data.random_split(ds, [n_train, n_val, n_test])
+        if args.test_eval:
+            test_loader = DataLoader  (test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+        else:
+            train_loader = DataLoader (train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+            val_loader = DataLoader   (val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
     else:
-        train_loader = DataLoader (train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
-        val_loader = DataLoader   (val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
+        t = make_transforms(args.img_size)
+        eval_ds = HoloDataset(args.data_dir, transform=None)
+        eval_loader = DataLoader  (eval_ds,  batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=True)
+
     model = UNet(in_channels=3 if args.z_mm != 0 else 1, out_channels=1).to(device)
     model.apply(init_weights_to_random)
+    model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    # Source - https://stackoverflow.com/a
+    # Posted by patapouf_ai, modified by community. See post 'Timeline' for change history
+    # Retrieved 2025-12-31, License - CC BY-SA 4.0
+    for g in optimizer.param_groups:
+        g['lr'] = args.lr
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.9)
 
-    #scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
-    scaler = None
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+    #scaler = None
     print('Model summary:')
     print(f'input_size: (1, {args.in_ch}, {args.img_size}, {args.img_size})')
     print(f"model device = {next(model.parameters()).device}")
+    if args.load_checkpoint:
+        checkpoint_path = args.load_checkpoint
+        #checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state'])
+        optimizer.load_state_dict(checkpoint['optim_state'])
+        best_val = checkpoint.get('best_val', float('inf'))
+
     model.to(device)
 
     print(f"MOD PARM: {next(model.parameters()).device}") # Check model device
@@ -891,55 +1071,66 @@ def main():
     best_val = float('inf')
     # model gradient reset
     model.zero_grad()
-    # read checkpoint state if exists
-    if args.load_checkpoint:
-        checkpoint_path = args.load_checkpoint
-        if os.path.exists(checkpoint_path):
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state'])
-            optimizer.load_state_dict(checkpoint['optim_state'])
-            start_epoch = checkpoint['epoch'] + 1
-            best_val = checkpoint.get('best_val', float('inf'))
-            print(f'Loaded checkpoint from {checkpoint_path}, resuming from epoch {start_epoch}')
     print('Starting training...')
     print (args.test_eval)
     print(int(args.epochs)+1)
     print ("----------------")
+    if args.eval_only:
+        evaluate(model, eval_loader, device, 0)
+        print('Evaluation complete.')
+        return  
+    model = model.float()
+    model=model.to(device)
     for epoch in range(1, int(args.epochs)+1):
-        model = model.float()
-        model=model.to(device)
         model.zero_grad()
+        for g in optimizer.param_groups:
+            g['lr'] = args.lr
+            args.lr = args.lr * 0.95
+            if args.lr < 0.01*np.exp(-epoch/70):
+                args.lr = 0.05*np.exp(-epoch/70)
         if args.test_eval:
             test_loss = validate(model, test_loader, device, epoch)
             print(f'Test Loss: {test_loss:.6f}')
             break
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, scaler)
+        model.to(device)
+        early_stop, train_loss = train_one_epoch(model, train_loader, optimizer, device, scaler,epoch)
         val_loss = validate(model, val_loader, device, epoch)
-        optimizer.step()
-        scheduler.step(val_loss)
+        #optimizer.step()
+        #scheduler.step(val_loss)
         current_lr = optimizer.param_groups[0]['lr']
         is_best = val_loss < best_val
-        if is_best:
+        if is_best or early_stop:
+            name = 'best' if is_best else 'earlystop'
+            if is_best and early_stop:
+                name = 'best_earlystop'
             best_val = val_loss
             save_checkpoint({
                 'epoch': epoch,
                 'model_state': model.state_dict(),
                 'optim_state': optimizer.state_dict(),
                 'val_loss': val_loss,
-            }, args.checkpoints, name=f'epoch{epoch:03d}_best.pth')
+                'lr': current_lr,
+                'best_val': best_val,
+            }, args.checkpoints, name=f'epoch{epoch:03d}_{name}.pth')
         best_indicator = '****' if is_best else '    '
+        if early_stop:
+            best_indicator = 'STOP'
         print(f'Epoch {epoch:03d}  Train Loss: {train_loss:.6f}  Val Loss: {val_loss:.6f}  Best: {best_val:.6f}{best_indicator} LR: {current_lr:.6e}')
         if not os.path.exists(os.path.join(trial_dir, 'training_log.csv')):
             print('epoch,timestamp,train_loss,val_loss,best_val,learning_rate,is_best', file=open(os.path.join(trial_dir, 'training_log.csv'), 'w'))
         nowstamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"{epoch},{nowstamp},{train_loss:.6f},{val_loss:.6f},{best_val:.6f},{current_lr:.6e},{'1' if is_best else '0'}",
               file=open(os.path.join(trial_dir, 'training_log.csv'), 'a'))
-
+        if early_stop:
+            print('Early stopping triggered. Ending training.')
+            break
     if not args.test_eval:
         save_checkpoint({
             'epoch': epoch,
             'model_state': model.state_dict(),
             'optim_state': optimizer.state_dict(),
+            'lr': current_lr,
+            'best_val': best_val,
             'val_loss': val_loss,
         }, args.checkpoints, name=f'epoch{epoch:03d}_final.pth')
     print('Training complete. Best val loss:', best_val)
