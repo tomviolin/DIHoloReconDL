@@ -223,8 +223,9 @@ def fresnel_propagation_batch(u0_batch, wavelength, z, dx, device):
     k = 2.0 * np.pi / wavelength
     fx = torch.fft.fftfreq(W, d=dx, device=device)
     fy = torch.fft.fftfreq(H, d=dx, device=device)
+    zzz = z # * np.random.uniform(0.5, 5)  # to train for multiple distances
     FX, FY = torch.meshgrid(fx, fy, indexing='xy')
-    H_transfer = torch.exp(-1j * np.pi * wavelength * z * (FX ** 2 + FY ** 2)).to(dtype=torch.complex64)
+    H_transfer = torch.exp(-1j * np.pi * wavelength * zzz * (FX ** 2 + FY ** 2)).to(dtype=torch.complex64)
     U0 = fft.fft2(u0_batch)
     U1 = U0 * H_transfer
     u1 = fft.ifft2(U1)

@@ -3,4 +3,4 @@ torch==2.9.1+cu126
 torchvision>=0.24
 torchaudio==2.9.1+cu126
 torchmetrics
-
+torchviz

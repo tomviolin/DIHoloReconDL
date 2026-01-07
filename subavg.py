@@ -8,17 +8,17 @@ import os,sys,shutil
 
 from dialog import Dialog
 
-dlg = Dialog(dialog="whiptail")
+dlg = Dialog(dialog="dialog")
 
 
-def fixmedian(img):
+def fixhololevel(img):
     img=img-img.min()
     img=img/img.max()
-    for i in range(1):
-        median = np.median(img)
-        factor = np.log(0.5)/np.log(median)
-        fixed = img ** factor
-        img= fixed
+    h = np.histogram(img, bins=256, range=(0,1))
+    modebin = np.argmax(h[0])
+    mode = (h[1][modebin] + h[1][modebin+1]) / 2
+    exponent = np.log(0.5)/np.log(mode)
+    img = img ** exponent
     return img
 
 def main():
@@ -29,23 +29,24 @@ def main():
     choices = []
     for d in datadirs:
         dh = d.split('/')[1]
-        raws = glob(os.path.join(d, "*"))
+        raws = sorted(glob(os.path.join(d, "*")))
         if not raws:
             continue
         rc = len(raws)
-        desc = "[{} raw]".format(rc)
+        desc = "[{:4d} raw]".format(rc)
         holos = glob( os.path.join( d.replace("/raw/","/holo/"), "*") )
         hc = len(holos)
         if hc > 0:
-            desc = desc + " [{} holo]".format(hc)
+            desc = desc + " [{:4d} holo]".format(hc)
         else:
-            desc = desc + " \\Zb\\Z1[     ]\\Zn".format(hc)
+            desc = desc + " [         ]".format(hc)
         if os.path.exists( os.path.join(d, "readme.txt") ):
             with open( os.path.join(d, "readme.txt"), 'r') as f:
                 firstline = f.readline().strip()
                 desc = desc + " " +firstline
         choices.append( (dh, desc) )
-    dresult = dlg.menu("Select a dataset to process:", choices=choices)
+    choices = sorted(choices)
+    dresult = dlg.menu("Select a dataset to process:", choices=choices, width=78)
     if dresult[0] != dlg.DIALOG_OK:
         print("")
         sys.exit(1)
@@ -66,65 +67,20 @@ def main():
         print(f"No image files found in {rawdir}")
         sys.exit(1)
 
-    sum_image = None
-    count = 0
-    imgs = []
-    imgwindow = []
-    windowradius = 50
-    windowsize = windowradius*2 + 1
-    lastimg = None
-    for rawfile in rawfiles:
-        print(f"Reading {rawfile}...")
-        img = cv2.imread(rawfile, cv2.IMREAD_GRAYSCALE).astype(np.float32)/255.0
-        img = fixmedian(img)
-        if img is None:
-            print(f"Failed to read {rawfile}, skipping.")
-            continue
-        imgs.append(fixmedian(img.copy()))
+    imgs = np.array([cv2.imread(f, cv2.IMREAD_GRAYSCALE).astype(np.float32)/255.0 for f in rawfiles])
 
-    imgavg = np.sum(imgs, axis=0) / len(imgs)
-    imgavg = fixmedian(imgavg)
-    cv2.imshow("Image Average Window", (imgavg*255).astype(np.uint8))
-    if cv2.waitKey(5) == 27:
-        print("Process interrupted by user.")
-        sys.exit(0)
+    imgs = fixhololevel(imgs)
 
-    for idx, img in enumerate(imgs):
-        img = (img+0.1) / (imgavg+0.1)
-        img = fixmedian(img)
+    imgs = np.clip(imgs, 0, 1)
+    imgs = imgs - imgs.mean(axis=0)
+    imgs = imgs / np.max(np.abs(imgs))*0.5 + 0.5
 
-        filename = os.path.basename(rawfiles[idx])
+    print(f"value range: min {imgs.min()} max {imgs.max()}")
+    for i in range(imgs.shape[0]):
+        filename = os.path.basename(rawfiles[i])
         outpath = os.path.join(outdir, filename)
-        cv2.imwrite(outpath.replace(".jpg",".png"), np.uint8(img*255))
-    sys.exit(0)
-    if False:
-        img = img.astype(np.float32)/255.0
-        if sum_image is None:
-            sum_image = np.zeros_like(img)
-        sum_image += img
-        count += 1
-
-    if count == 0:
-        print("No valid images were processed.")
-        sys.exit(1)
-
-    avg_image = sum_image / count
-    
-    for rawfile in rawfiles:
-        filename = os.path.basename(rawfile)
-        outpath = os.path.join(outdir, filename)
-        img = cv2.imread(rawfile, cv2.IMREAD_GRAYSCALE).astype(np.float32)/255.0
-
-        subtracted = (img+1) / (avg_image+1)
-        subtracted -= subtracted.min()
-        subtracted /= subtracted.max()
-        
-        print(f"pixel range: min {subtracted.min()} max {subtracted.max()}")
-        subtracted = np.clip(subtracted, 0, 1)
-        subtracted = (subtracted * 255).astype(np.uint8)
-        cv2.imwrite(outpath.replace(".jpg",".png"), subtracted)
+        cv2.imwrite(outpath.replace(".jpg",".png"), np.uint8(imgs[i]*255))
         print(f"Saved processed image to {outpath}")
-
 
 
 if __name__ == "__main__":

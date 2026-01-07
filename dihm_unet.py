@@ -20,6 +20,9 @@ Usage:
 
 import os, sys, math
 from dialog import Dialog
+import matplotlib.pyplot as plt
+import matplotlib
+import PIL,io
 import locale
 locale.setlocale(locale.LC_ALL, '')
 dlg = Dialog(dialog="dialog")
@@ -487,7 +490,7 @@ class PairedHoloDataset(Dataset):
         return torch.from_numpy(holo), torch.from_numpy(gt)
 
 class HoloDataset(Dataset):
-    """Loads unpaired holograms. no ground-truth images.  
+    """Loads unpaired holograms. no ground-truth images. This is for evaluation/inference-only mode.
     Directory structure:
       data_dir/
         holo/
@@ -541,8 +544,8 @@ class HoloDataset(Dataset):
         if holo.ndim == 2:
             holo = np.expand_dims(holo, 0)
         if self.transform is not None:
-            return self.transform(torch.from_numpy(holo))
-        return torch.from_numpy(holo)
+            return self.transform(torch.from_numpy(holo)), str(holo_p)
+        return (torch.from_numpy(holo), str(holo_p))
 
 
 # -----------------------
@@ -565,11 +568,11 @@ def train_one_epoch(model, loader, optim, device, scaler, epoch):
     loop_count = 0
     for x, y in loader:
         if args.blur_holo:
-            k = 7 # (5-(epoch//2 % 3)*2)    #np.random.randint(low=0,high=5, size=1)[0]*2+1
-            sd = 3#  -(epoch//2 % 4)/2 #np.random.uniform(2,4,1)[0]
+            k = 3 # (5-(epoch//2 % 3)*2)    #np.random.randint(low=0,high=5, size=1)[0]*2+1
+            sd = 0#  -(epoch//2 % 4)/2 #np.random.uniform(2,4,1)[0]
             xx = x[0,0].cpu().detach().numpy()
             xx = cv2.GaussianBlur(xx, (k,k),sd)
-            xx *= np.random.random(size=xx.shape)*0.05+np.random.random()*0.2 + 0.75
+            xx *= np.random.random(size=xx.shape)*0.20+np.random.random()*0.1 + 0.70
             x[0,0,...] = torch.from_numpy(xx)
         if args.blur_gt:
             k = 5 #np.random.randint(low=0,high=3, size=1)[0]*2+1
@@ -621,8 +624,8 @@ def train_one_epoch(model, loader, optim, device, scaler, epoch):
             optim.zero_grad()
             loss.backward()
             optim.step()
-            scheduler.step()
-        total_loss += float(loss.item()) * x.size(0)
+            scheduler.step(loss)
+        total_loss += float(loss.item()) * x.size(0) * x.size(1) # account for batch and channel size
         if guicoop():
             return True, total_loss / len(loader.dataset)
     return False, total_loss / len(loader.dataset)
@@ -717,29 +720,114 @@ def validate(model, loader, device, epoch):
 
 
 
-def evaluate(model, loader, device, epoch):
+def evaluate(model, loader, device, img_size):
+    plt.ioff()
     model.eval()
     model.to(device)
     datanum = 0
+    firstdraw = True
+    fig,(ax0,ax1) = plt.subplots(1,2, figsize=(8,4))
     with torch.no_grad():
-        for x in loader:
+        for x, holoname in loader:
             ##print(f"Validate: x shape = {x.shape}, y shape = {y.shape}")
-            if guicoop(): coop_exit()
             #print(F"x from loader shape: {x.shape}, y from loader shape: {y.shape}")
+            #x[0,0,...] = torch.from_numpy(cv2.medianBlur(np.uint8(x[0,0].cpu().detach().numpy()*255),3)/255.0)
             x=fixhololevel(x)
-            x = x.to(device=device, dtype=torch.float)
-            out = model(x)
-            pic_in= np.clip((x  [0,0,...].cpu().detach().numpy()*255),0,255).astype(np.uint8)
-            pic_out= np.clip((out[0,0,...].cpu().detach().numpy()*255),0,255).astype(np.uint8)
+            #print(f"BEFORE: x.shape={x.shape}, img_size={img_size}")
+            # test for need of cropping - 'cause cropping is easier -- kinda.
+            xover=0; yover=0
+            xover1=0; yover1=0
+            if x.shape[2] > img_size:
+                yover = x.shape[2] - img_size
+                yover1 = yover // 2
+            if x.shape[3] > img_size:
+                xover = x.shape[3] - img_size
+                xover1 = xover // 2
+            x = x[:,:,yover1:yover1+x.shape[2], xover1:xover1+x.shape[3]]
+            # now we know we can fit in img_size x img_size, now we can
+            # test for need of padding
+            # initalize all padding values to zero
+            padx=0; pady=0
+            if x.shape[2] < img_size: pady = (img_size - x.shape[2]) // 2
+            if x.shape[3] < img_size: padx = (img_size - x.shape[3]) // 2
+            org_shape = x.shape
+            # no need to compute the padding on both sides; just pad one side half the total pad
+            # needed, and then place the image starting that spot. The other side with
+            # get the other half 'cause that's what's left.
 
-            divider = np.zeros((pic_in.shape[0],10), dtype=np.uint8)
+            if padx > 0 or pady > 0:
+                # make a new array filled with padding value (0.5) and then
+                # place the image in it. Half way up the shortage on each side, easy.
+                # multiple images in batch or more than one image/color channel? no problem,
+                # because we are just dropping the image in the center for the array
+                # of padding we created. No loops needed.  Got'er done!
+                xalt = torch.ones((x.shape[0],x.shape[1],img_size, img_size), dtype=torch.float) * 0.5
+                xalt[:,:,pady:pady+x.shape[2], padx:padx+x.shape[3]] = x[:,0,...]
+                x = xalt
+            x = x.to(device=device, dtype=torch.float)
+            #print(f"AFTER: x.shape={x.shape}, holoname={holoname}")
+            out = model(x)
+            x = x[:,:,pady:pady+org_shape[2], padx:padx+org_shape[3]]
+            out = out[:,:,pady:pady+org_shape[2], padx:padx+org_shape[3]]
+            pic_in= np.clip((   x[0,0,...].cpu().detach().numpy()*255),0,255).astype(np.uint8)
+            pic_out= np.clip((out[0,0,...].cpu().detach().numpy()*255),0,255).astype(np.uint8)
+            #holoname = os.path.basename(holoname[0]) 
+
+            if firstdraw:
+                # set up overall figure layout
+                ax0.clear()
+                ax1.clear()
+                # first figure setup
+                im0 = ax0.imshow(pic_in, cmap='binary_r',aspect=1,animated=True, vmin=0, vmax=255)
+                ax0.axis('off')
+                # second figure setup
+                im1 = ax1.imshow(pic_out, cmap='binary_r',aspect=1, animated=True, vmin=0, vmax=255)
+                ax1.axis('off')
+                plt.figtext(.2,0.01,'(c) 2024 Tom Hansen - MIT License   --   tomh@tomhansen.com   --  github.com/tomviolin/DIHoloReconDL', fontsize=8)
+                plt.figtext(.02,0.045,'Ref: Li, Huayu, et al. “Deep DIH: Single-Shot Digital In-Line Holography Reconstruction by Deep Learning.”\nIEEE Access, vol. 8, 2020, pp. 202648–59. IEEE Xplore, https://doi.org/10.1109/ACCESS.2020.3036380.', fontsize=6)
+
+                ax1.set_title('U-Net CNN Deep Learning Output', fontsize=10)
+
+                fig.tight_layout()
+
+                firstdraw = False
+            else:
+                im0.set_array(pic_in)
+                im1.set_array(pic_out)
+                ax0.set_title(f'{holoname}', fontsize=7)
+
+            
+            fig.canvas.draw()
+            nparray = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            img_array = nparray.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+            img_array = cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGR)
+            cv2.imshow('validation', img_array)
+            
+            print(".", end='', flush=True)
+            if guicoop(): coop_exit()
+            #os.makedirs(f'{trial_dir}/val_images', exist_ok=True)
+            #cv2.imwrite(f'{trial_dir}/val_images/eval_{datanum:04d}.png', img_array)
+            
+            """
+            divider = np.zeros((pic_in.shape[0]+50,10), dtype=np.uint8)
+            header1 = np.zeros((50, pic_in.shape[1]), dtype=np.uint8)
+            header2 = np.zeros((50, pic_out.shape[1]), dtype=np.uint8)
+            cv2.putText(header1, 'Input Hologram', (10,35), cv2.FONT_HERSHEY_PLAIN, 0.9, (255,), 1)
+            cv2.putText(header2, 'Network Output', (10,35), cv2.FONT_HERSHEY_PLAIN, 0.9, (255,), 1)
+            pic_in = np.vstack((header1, pic_in))
+            pic_out= np.vstack((header2, pic_out))
             pic = np.hstack((pic_in,divider,pic_out)) #, divider, pic_in_prop))
-            cv2.imshow('validation', pic)
+            """
+
+            #cv2.imshow('validation', pic)
             picdir = f'{trial_dir}/val_images'
             nowstamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
             os.makedirs(picdir, exist_ok=True)
             datanum += 1
-            cv2.imwrite(f'{picdir}/val_{epoch:03d}_{datanum:04d}_{nowstamp}.png', pic)
+            srcname = str(holoname)
+            print(srcname[7:-2])
+            # ['data_cap2026-0102-014404_holo_frame00014.png']
+            plt.savefig(f'{trial_dir}/val_images/eval_{srcname[7:-2]}.png'.replace('/holo/','_'))
 
             #cv2.imshow('gt',  y[0,0].cpu().detach().numpy())
             #cv2.imshow('in',  x  [0,0,...].cpu().detach().numpy())
@@ -762,7 +850,8 @@ l1 = nn.L1Loss()
 mse = nn.MSELoss()
 
 def loss_fn(pred, target):
-    return l1(pred, target)*0.2 + 0.8*mse(pred, target)
+    return torch.sum((torch.abs(pred - target)+1.0)**2.0 - 1.0)/pred.numel()
+    #return l1(pred, target)*0.0 + 1.0*mse(pred, target)
 
 
 
@@ -916,6 +1005,7 @@ def main():
                 desc = ''
             #print(f"Found past checkpoint: {pc.split(',')[1]}  (trial desc: {desc})")
         choices = [ ( "NONE", "No Pre-training"), ] + [ (pc.split(',')[1], f"{pc.split(',')[0]}  ({os.path.dirname(os.path.dirname(pc.split(',')[1]))})") for pc in sorted(past_checkpoints)]
+        choices=sorted(choices, reverse=True)
         #print(choices)
         dresult = dlg.menu(choices=choices, text='Found past checkpoints. Select one to load, or NONE to start fresh.', title='Load Checkpoint', width=90, height=20, default_item=args.load_checkpoint if args.load_checkpoint != '' else "NONE")
         if dresult[0] != dlg.OK:
@@ -951,23 +1041,30 @@ def main():
     for dr in dirlist:
         holos = glob(os.path.join(dr, 'holo/*'))
         gts = glob(os.path.join(dr, 'gt/*'))
+        raws = glob(os.path.join(dr, 'raw/*'))
         if len(holos) == 0 :
             continue
-        desc = f"[{len(holos)}] "+readme_text(dr)
+        desc = f"[{len(holos)} holo] [{len(gts)} gt] [ {len(raws)} raw] "+readme_text(dr)
         dtag = dr.split('/')[-1]
         choices.append( (dtag, desc) )
-    code, direct = dlg.menu(choices=choices,
+        choices = sorted(choices)
+    while True:
+        code, direct = dlg.menu(choices=choices,
                                text='Select data directory (must contain holo/ and gt/ subfolders):',
                                title='Select Data Directory',
                                width=90,
                                height=20,
                                default_item=args.data_dir.split('/')[-1] if args.data_dir is not None else None)
-    if code != dlg.OK:
-        print('Exiting...')
-        sys.exit(0)
+        if code != dlg.DIALOG_OK:
+            print('Exiting...')
+            sys.exit(0)
+        data_dir = os.path.join('data',direct)
+        argdict['data_dir'] = data_dir
+        os.system(f"eog data/{direct}/holo")
+        confirm = dlg.yesno(text=f'Selected data directory: {direct}. Proceed?', title='Confirm Data Directory')
+        if confirm == dlg.DIALOG_OK:
+            break
 
-    data_dir = os.path.join('data',direct)
-    argdict['data_dir'] = data_dir
 
     if args.load_checkpoint:
         checkpoint = torch.load(args.load_checkpoint, map_location=device, weights_only=False)
@@ -1015,7 +1112,7 @@ def main():
         json.dump(trial_json_dict, f, indent=4)
 
     cv2.namedWindow('validation',  cv2.WINDOW_NORMAL)
-    cv2.resizeWindow('validation', 1200,400)
+    cv2.resizeWindow('validation', 1200,800)
     cv2.moveWindow('validation', 0,0)
     device = torch.device(args.device)
 
@@ -1036,6 +1133,7 @@ def main():
             train_loader = DataLoader (train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
             val_loader = DataLoader   (val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
     else:
+        # EVAL ONLY: no gts
         t = make_transforms(args.img_size)
         eval_ds = HoloDataset(args.data_dir, transform=None)
         eval_loader = DataLoader  (eval_ds,  batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=True)
@@ -1049,7 +1147,7 @@ def main():
     # Retrieved 2025-12-31, License - CC BY-SA 4.0
     for g in optimizer.param_groups:
         g['lr'] = args.lr
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.9)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.99)
 
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     #scaler = None
@@ -1076,7 +1174,7 @@ def main():
     print(int(args.epochs)+1)
     print ("----------------")
     if args.eval_only:
-        evaluate(model, eval_loader, device, 0)
+        evaluate(model, eval_loader, device,args.img_size)
         print('Evaluation complete.')
         return  
     model = model.float()
@@ -1085,9 +1183,9 @@ def main():
         model.zero_grad()
         for g in optimizer.param_groups:
             g['lr'] = args.lr
-            args.lr = args.lr * 0.95
-            if args.lr < 0.01*np.exp(-epoch/70):
-                args.lr = 0.05*np.exp(-epoch/70)
+            args.lr = args.lr * 0.98
+            #if args.lr < 0.01*np.exp(-epoch/70):
+            #    args.lr = 0.05*np.exp(-epoch/70)
         if args.test_eval:
             test_loss = validate(model, test_loader, device, epoch)
             print(f'Test Loss: {test_loss:.6f}')
